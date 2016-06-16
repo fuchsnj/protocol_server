@@ -13,30 +13,30 @@ struct TestHandler{
 	sender: Sender<u64>
 }
 impl Handler for TestHandler{
-    type Frame = ();
+    type Frame = String;
     type InvalidFrame = ();
 	type Error = ();
     
-    fn new_connection(&self, conn: &Connection<()>) -> Result<(), ()>{
-        thread::sleep(Duration::from_millis(1000));
+    fn new_connection(&self, conn: Connection<Self::Frame>) -> Result<(), ()>{
+		thread::sleep(Duration::from_millis(100));
 		self.sender.send(1);
         Ok(())
     }
     fn connection_ended(&self, id: usize, reason: EndSessionReason){}
-    fn decode_frame<R: BufRead>(&self, reader: &mut R) -> io::Result<Result<(), ()>>{
-        // let mut output = Vec::new();
-        // try!(reader.read_until('\n' as u8, &mut output));
-        // Ok(Ok(String::from_utf8_lossy(&output).into_owned()))
+    fn decode_frame<R: BufRead>(&self, reader: &mut R) -> io::Result<Result<Self::Frame, ()>>{
 		self.sender.send(2);
-		Ok(Ok(()))
+		let mut output = Vec::new();
+		try!(reader.read_until('\n' as u8, &mut output));
+		Ok(Ok(String::from_utf8_lossy(&output).into_owned()))
     }
-    fn on_frame(&self, frame: (), conn: &Connection<()>) -> Result<(), ()>{
+    fn on_frame(&self, frame: Self::Frame, conn: Connection<Self::Frame>) -> Result<(), ()>{
 		Ok(())
     }
 }
 
 #[test]
-fn block_new_connection() {
+fn test() {
+	println!("test 5001");
 	let (send, recv) = channel();
 	let echo_handler = TestHandler{
 		sender: send

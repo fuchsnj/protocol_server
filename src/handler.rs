@@ -5,13 +5,13 @@ use std::fmt::Debug;
 use {Connection};
 
 #[derive(Debug)]
-pub enum EndSessionReason{
+pub enum ConnectionEndedReason{
 	IoError(io::Error),
 	ClientShutdown
 }
 
 pub trait Handler: Sized + Clone + Send + 'static{
-	type Frame;
+	type Frame: Send;
 	type InvalidFrame;
 	type Error: Debug;
 	
@@ -22,26 +22,28 @@ pub trait Handler: Sized + Clone + Send + 'static{
 	/// You can retrieve a unique connection id from `conn.get_id()` if you
 	/// want to associate data with the connection
 	///
-	/// This function is called on it's own dedicated thread. Blocking actions are
-	/// intended to be run here if needed and will only block incoming IO on the current connection.
-	/// No other connections are affected.
+	/// Blocking actions are intended to be run here if needed and will NOT affect processing
+	/// of other connections. Processing for this connection will not start until after
+	/// `new_connection` returns.
 	///
 	/// Any error returned here will close the connection, calling `connection_ended`
 	
-	fn new_connection(&self, conn: &Connection<Self::Frame>) -> Result<(), Self::Error>;
+	fn new_connection(&self, conn: Connection<Self>) -> Result<(), Self::Error>;
 	
 	/// Called when a connection has closed.
 	///
 	/// The unique id of the connection is returned to perform any needed cleanup.
+	/// Any blocking actions performed here will NOT affect performance of any other connections.
 	///
 	/// If you stored your own copy of the `Connection`, read/writes to that connection
 	/// will fail.
-	fn connection_ended(&self, id: usize, reason: EndSessionReason);
+	fn connection_ended(&self, id: usize, reason: ConnectionEndedReason);
 	
 	/// Called when there is data on the connection ready to be read.
 	///
 	/// This function is called on it's own dedicated thread. Blocking actions ran
-	/// here will 
+	/// here will only slow down processing on the current connection. (frames are decoded
+	/// in the same order they are received from the socket)
 	/// No other connections are affected.
 	///
 	/// If any read operation reaches EOF, it is assumed there is not enough data
@@ -56,17 +58,17 @@ pub trait Handler: Sized + Clone + Send + 'static{
 	fn decode_frame<R: BufRead>(&self, reader: &mut R) -> io::Result<Result<Self::Frame, Self::InvalidFrame>>;
 	
 	
+	fn encode_frame<W: Write>(&self, frame: Self::Frame, writer: &mut W) -> io::Result<()>;
+	
 	/// Called when a frame is ready to be processed.
 	///
-	/// This function is called on it's own dedicated thread. Blocking actions are
-	/// intended to be run here if needed and will not slow down processing of
-	/// this, or any other connection. 
-	///
-	/// It is possible that multiple frames could be processed by this function for the
-	/// same connection in parallel. While it is guaranteed that this function will be called
-	/// in the order requests are received, since they are being processed in parallel
-	/// responses could be sent in any order.
+	/// This function is called on it's own dedicated thread. Blocking actions can be run
+	/// here if needed without affecting any other connections. `on_frame` is called serially
+	/// in the order that frames are received. The next frame from the same connection cannot
+	/// be processed until this function returns. To allow faster processing of the next frame,
+	/// you may `clone()` the connection to respond after returning from this function, but you
+	/// are then in charge of responding in the correct order (if required by your protocol).
 	///
 	/// Any error returned will end the current connection, calling `connection_ended`.
-	fn on_frame(&self, frame: Self::Frame, conn: &Connection<Self::Frame>) -> Result<(), Self::Error>;
+	fn on_frame(&self, frame: Self::Frame, conn: Connection<Self>) -> Result<(), Self::Error>;
 }

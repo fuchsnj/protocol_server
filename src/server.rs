@@ -1,5 +1,5 @@
 use mio;
-use mio::tcp::*;
+use mio::tcp::TcpListener;
 use mio::util::Slab;
 use std::marker::PhantomData;
 use std::net::ToSocketAddrs;
@@ -9,12 +9,16 @@ use std::io::{Cursor, Read, Write, BufRead};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
+use server_socket_handler::ServerSocketHandler;
+use client_handler::ClientHandler;
+
 use {Handler, ProtocolResult};
-use handler::EndSessionReason;
+use handler::ConnectionEndedReason;
 use threadpool::ThreadPool;
 use std::thread;
-
-const SERVER: mio::Token = mio::Token(0);
+use socket::Socket;
+use socket;
+use event_loop_message::EventLoopMessage;
 
 struct AsyncReader<R: BufRead>{
 	inner: R
@@ -58,205 +62,11 @@ impl<R: BufRead> Read for AsyncReader<R>{
 	}
 }
 
-struct Socket{
-	token: mio::Token,
-	read_buf: Option<Vec<u8>>,
-	write_buf: Option<Vec<u8>>,
-	socket: TcpStream
-}
-impl Socket{
-	fn new<H: Handler>(socket: TcpStream, token: mio::Token,
-		event_loop: &mut mio::EventLoop<RunningServer<H>>) -> io::Result<Socket>{
-
-		let conn = Socket{
-			token: token,
-			socket: socket,
-			read_buf: None,
-			write_buf: None
-		};
-		Ok(conn)
-	}
-	fn reregister<H: Handler>(&self, event_loop: &mut mio::EventLoop<RunningServer<H>>) -> io::Result<()>{
-		event_loop.reregister(
-			&self.socket,
-			self.token,
-			self.get_event_set(),
-			mio::PollOpt::edge() | mio::PollOpt::oneshot()
-		)
-	}
-	fn register<H: Handler>(&self, event_loop: &mut mio::EventLoop<RunningServer<H>>) -> io::Result<()>{
-		event_loop.register(
-			&self.socket,
-			self.token,
-			self.get_event_set(),
-			mio::PollOpt::edge() | mio::PollOpt::oneshot()
-		)
-	}
-	fn get_event_set(&self) -> mio::EventSet{
-		let write = match self.write_buf{
-			Some(_) => mio::EventSet::writable(),
-			None => mio::EventSet::none()
-		};
-		mio::EventSet::readable() | write
-	}
-	fn get_id(&self) -> usize{
-		self.token.0
-	}
-}
-
-pub struct Connection<F>{
-	sender: Sender<F>,
-	token: mio::Token
-}
-
-enum Message{
-	Register(mio::Token),
-	ReRegister(mio::Token)
-}
-
-struct RunningServer<H>
-where H: Handler{
-	server: TcpListener,
-	sockets: Slab<Socket>,
-	handler: H,
-	thread_pool: ThreadPool
-}
-impl<H> RunningServer<H>
-where H: Handler{
-	fn new(server: TcpListener, handler: H) -> RunningServer<H>{
-		RunningServer{
-			server: server,
-			sockets: Slab::new_starting_at(mio::Token(1), 1000000),
-			handler: handler,
-			thread_pool: ThreadPool::new(100)
-		}
-	}
-	fn shutdown_connection(&mut self, token: mio::Token, reason: EndSessionReason){
-		if let Some(sock) = self.sockets.remove(token){
-			self.handler.connection_ended(sock.get_id(), reason);
-		}
-	}
-}
-
-impl<H> mio::Handler for RunningServer<H>
-where H: Handler{
-	type Timeout = ();
-	type Message = Message;
-	
-	fn notify(&mut self, event_loop: &mut mio::EventLoop<Self>, msg: Message){
-		match msg{
-			Message::Register(token) => {
-				self.sockets[token].register(event_loop).unwrap();
-			},
-			Message::ReRegister(token) => {
-				self.sockets[token].reregister(event_loop).unwrap();
-			}
-		}
-	}
-	
-	fn ready(&mut self, event_loop: &mut mio::EventLoop<Self>, token: mio::Token, _events: mio::EventSet){
-		if token == SERVER{
-			loop{
-				match self.server.accept(){
-					Ok(Some((socket, _addr))) => {
-						println!("connection accepted");
-						// let (send, _receive) = channel();
-						// let conn = Connection{
-						// 	sender: send
-						// };
-						
-									
-						let token = self.sockets.insert_with(|token|{
-							Socket::new(socket, token, event_loop).unwrap()
-						}).unwrap();//fails if no tokens available
-						
-						{
-							let sender = event_loop.channel();
-							let handler = self.handler.clone();
-							self.thread_pool.execute(move ||{
-								println!("NEW CONNECTION!");
-								
-								let (send, _receive) = channel();
-								let conn = Connection{
-									sender: send,
-									token: token
-								};
-								handler.new_connection(&conn).unwrap();
-								sender.send(Message::Register(token)).unwrap();
-							});
-						}
-					},
-					Ok(None) => {
-						break;
-					},
-					Err(e) => {
-						panic!("listener.accept() errored: {}", e);
-					}
-				}
-			}
-			event_loop.reregister(
-				&self.server,
-				SERVER,
-				mio::EventSet::readable(),
-				mio::PollOpt::edge() | mio::PollOpt::oneshot()
-			).unwrap();//server socket IO error... something is really broken
-			
-		}else{
-			let mut read_buf = match self.sockets[token].read_buf.take(){
-				Some(buf) => buf,
-				None => Vec::new()
-			};
-			match self.sockets[token].socket.try_read_buf(&mut read_buf){
-				Ok(Some(0)) => {
-					//TODO:
-					//reading half of socket has closed. Flush remaining write buffer
-					//then close the socket
-					self.shutdown_connection(token, EndSessionReason::ClientShutdown);
-					return;
-				},
-				Err(e) => {
-					self.shutdown_connection(token, EndSessionReason::IoError(e));
-					return;
-				},
-				Ok(_) => {/* do nothing */}
-			}
-			
-			let mut async_reader = AsyncReader::new(Cursor::new(read_buf));
-			match self.handler.decode_frame(&mut async_reader){
-				Ok(Ok(frame)) => {
-					let (send, _receive) = channel();
-					let conn = Connection{
-						sender: send,
-						token: token
-					};
-					self.handler.on_frame(frame, &conn).unwrap();
-					let cursor = async_reader.into_inner();
-					let pos = cursor.position();
-					let read_buf = cursor.into_inner();
-					if read_buf.len() as u64 != pos+1{
-						self.sockets[token].read_buf = Some((&read_buf[pos as usize..]).to_vec());
-					}
-				},
-				Ok(Err(_bad_frame)) => {
-					println!("protocol error");
-				}
-				Err(io_err) => {
-					if io_err.kind() == io::ErrorKind::WouldBlock{
-						self.sockets[token].read_buf = Some(async_reader.into_inner().into_inner());
-					}else{
-						panic!("real IO error");
-					}
-				}
-			};
-			self.sockets[token].reregister(event_loop).unwrap();
-		}
-	}
-}
-
 pub struct Server<H>{
 	handler: H
 }
-
+//TODO: allow setting read/write timeout (per connection maybe?)
+//TODO: set notify queue size very high
 impl<H> Server<H>
 where H: Handler{
 	pub fn new(handler: H) -> Server<H>{
@@ -265,29 +75,110 @@ where H: Handler{
         }
 	}
 	pub fn start<A: ToSocketAddrs>(self, addr: A) -> ProtocolResult<()>{
-		let addr = match try!(addr.to_socket_addrs()).next(){
-            Some(addr) => addr,
-            None => {
-				return Err(
-					io::Error::new(io::ErrorKind::InvalidInput, "asdf").into()
-				)
-			}
-        };
-
-        let tcp_listener = try!(TcpListener::bind(&addr));
 		
-		let mut event_loop = mio::EventLoop::new().unwrap();
-		try!(event_loop.register(
-			&tcp_listener,
-			SERVER,
-			mio::EventSet::readable(),
-			mio::PollOpt::edge() | mio::PollOpt::oneshot()
-		));
+		let thread_pool = ThreadPool::new(100);
 		
-		let mut running_server = RunningServer::new(tcp_listener, self.handler);
-		thread::spawn(move ||{
-			event_loop.run(&mut running_server).unwrap();
+		
+		
+		let mut event_loop = try!(mio::EventLoop::new());
+		let client_sender = event_loop.channel();
+		let mut client_handler = ClientHandler::new(self.handler.clone(), thread_pool.clone());
+		let client_thread = thread::spawn(move ||{
+			client_handler.run(&mut event_loop);
 		});
+		
+		
+		let mut server_socket_handler = try!(
+			ServerSocketHandler::new(addr, client_sender, thread_pool, self.handler.clone())
+		);
+		let server_socket_thread = thread::spawn(move ||{
+			server_socket_handler.run();
+		});
+		
+		//let mut event_loop = mio::EventLoop::new().unwrap();
+		// let mut event_loop_2 = mio::EventLoop::new().unwrap();
+		// let sender1 = event_loop_1.channel();
+		// let sender2 = event_loop_2.channel();
+		// let mut handler1 = ClientHandler::new(self.handler.clone(), 0);
+		// let mut handler2 = ClientHandler::new(self.handler.clone(), 1);
+		
+
+
+
+        
+		
+		// let stream;
+		// let addr;
+		// loop{
+		// 	if let Some((a, b)) = tcp_listener.accept().unwrap(){
+		// 		stream = a;
+		// 		addr = b;
+		// 		break;	
+		// 	}
+		// }
+		// let stream2 = stream.try_clone().unwrap();
+		// println!("got connection from: {:?}", addr);
+		
+		// try!(event_loop_1.register(
+		// 	&stream,
+		// 	mio::Token(0),
+		// 	mio::EventSet::readable(),
+		// 	mio::PollOpt::edge() | mio::PollOpt::oneshot()
+		// ));
+		// // event_loop_1.deregister(&stream);
+		
+		// try!(event_loop_2.register(
+		// 	&stream2,
+		// 	mio::Token(1),
+		// 	mio::EventSet::readable(),
+		// 	mio::PollOpt::edge() | mio::PollOpt::oneshot()
+		// ));
+		// event_loop_2.deregister(&stream2);
+		//drop(stream);
+		//drop(stream2);
+		
+		// let client_thread_1 = thread::spawn(move ||{
+		// 	event_loop_1.run(&mut handler1).unwrap();
+		// });
+		// let client_thread_2 = thread::spawn(move ||{
+		// 	event_loop_2.run(&mut handler2).unwrap();
+		// }).join();
+		
+		
+		// let mut server_handler = ServerSocketHandler::new(tcp_listener);
+		
+		
+		// let server_thread = thread::spawn(move ||{
+		// 	server_handler.run();
+		// }).join();
+		
+		
+		//let num_event_loops = 2;
+		
+		// for index in 0..num_event_loops{
+		// 	let mut event_loop = mio::EventLoop::new().unwrap();
+		// 	let running_server = running_server.clone();
+		// 	thread::spawn(move ||{
+		// 		event_loop.run(&mut running_server).unwrap();
+		// 	});
+		// }
+		
+		
+		
+		
+		
+		// try!(event_loop.register(
+		// 	&tcp_listener,
+		// 	SERVER,
+		// 	mio::EventSet::readable(),
+		// 	mio::PollOpt::edge() | mio::PollOpt::oneshot()
+		// ));
+		//TODO: spawn multiple event loops in multiple threads
+		// each time reregistration occurs, choose random eventloop
+		// using the event loop channels and register to random eventloop
+		
+		server_socket_thread.join();
+		client_thread.join();
 		Ok(())
 	}
 }
